@@ -1,6 +1,8 @@
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { Type } from "typebox";
+import { v7 as uuidv7 } from "uuid";
 import WebSocket from "ws";
 const API_URL = (process.env.MYAGENT_API_URL || "https://myagent.to").replace(/\/$/, "");
 const STATE_PATH = process.env.MYAGENT_PI_STATE || join(homedir(), ".config", "myagent", "pi-binding.json");
@@ -62,6 +64,21 @@ async function currentSession(ctx) {
         throw new Error("Pi did not expose the current session file.");
     return { cwd, session_file };
 }
+async function requireActiveBinding(ctx) {
+    const state = await readState();
+    if (!state)
+        throw new Error("Run /myagent connect in this Pi session first.");
+    const current = await currentSession(ctx);
+    if (current.cwd !== state.cwd || current.session_file !== state.session_file) {
+        throw new Error("This Pi session is not the session connected to myagent.");
+    }
+    const status = await api("/v1/provider/status", {}, state.token);
+    const binding = status.binding;
+    if (!binding || binding.provider !== "pi" || binding.status !== "active" || binding.external_target_id !== state.session_id || binding.target_generation !== state.generation) {
+        throw new Error("This Pi session is no longer the active myagent binding. Run /myagent connect again.");
+    }
+    return state;
+}
 function stopReconnect() {
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
@@ -95,7 +112,7 @@ async function disconnect(ctx) {
     if (ctx)
         notify(ctx, "myagent disconnected from this Pi session.");
 }
-async function connect(ctx) {
+async function connect(pi, ctx) {
     const session = await currentSession(ctx);
     const start = await api("/v1/connect/start", { method: "POST", body: JSON.stringify({ permissions: PERMISSIONS }) });
     notify(ctx, `Open ${start.verification_url} and approve agent code ${start.user_code}.`);
@@ -117,11 +134,11 @@ async function connect(ctx) {
     state.generation = binding.binding.target_generation;
     await writeState(state);
     activeCtx = ctx;
-    await openSocket(ctx, state);
+    await openSocket(pi, ctx, state);
     notify(ctx, `myagent connected as ${state.address} in this Pi session.`);
-    await drain(ctx, state);
+    await drain(pi, ctx, state);
 }
-function scheduleReconnect(ctx, state) {
+function scheduleReconnect(pi, ctx, state) {
     if (reconnectTimer)
         return;
     // Capped exponential backoff from 1 to 30 seconds.
@@ -138,25 +155,25 @@ function scheduleReconnect(ctx, state) {
                 const status = await api("/v1/provider/status", {}, current.token);
                 if (!status.binding || status.binding.provider !== "pi" || status.binding.status !== "active" || status.binding.external_target_id !== current.session_id || status.binding.target_generation !== current.generation)
                     return;
-                await openSocket(ctx, current);
+                await openSocket(pi, ctx, current);
                 // Drain from the persisted bookmark; nothing was advanced while away.
                 const fresh = (await readState()) ?? current;
-                await drain(ctx, fresh);
+                await drain(pi, ctx, fresh);
             }
             catch {
-                scheduleReconnect(ctx, state);
+                scheduleReconnect(pi, ctx, state);
             }
         })();
     }, delay);
 }
-async function openSocket(ctx, state) {
+async function openSocket(pi, ctx, state) {
     closeSocket();
     const websocketUrl = `${API_URL.replace(/^http/, "ws")}/v1/reach/live`;
     socket = new WebSocket(websocketUrl, { headers: { authorization: `Bearer ${state.token}` } });
-    socket.on("message", () => { void drain(ctx, state); });
+    socket.on("message", () => { void drain(pi, ctx, state); });
     socket.on("close", () => {
         socket = null;
-        scheduleReconnect(ctx, state);
+        scheduleReconnect(pi, ctx, state);
     });
     socket.on("error", () => { try {
         socket?.close();
@@ -168,15 +185,18 @@ function streaming(ctx) {
 }
 function envelopeText(entry, replayed) {
     const payload = entry.payload || {};
-    const body = typeof payload.body === "string" ? payload.body : JSON.stringify(payload);
+    const content = typeof payload.content === "object" && payload.content ? payload.content : null;
+    const body = content?.encoding === "plaintext" && typeof content.text === "string"
+        ? content.text
+        : JSON.stringify(content ?? payload);
     const attachmentIds = Array.isArray(payload.attachment_ids) ? payload.attachment_ids.map(String).join(", ") : "";
     return [
         "[myagent inbox — external_untrusted: true]",
         `message_id: ${String(payload.message_id || entry.event_id)}`,
         `destination_sequence: ${entry.sequence}`,
-        `from_address: ${String(payload.from_address || payload.sender_address || "unknown")}`,
+        `from_address: ${String(payload.from || "unknown")}`,
         `received_at: ${entry.occurred_at}`,
-        `response_to: ${String(payload.response_to || "none")}`,
+        "reply: use myagent_send_message with an explicit destination address",
         ...(replayed ? ["replayed: true (this entry was injected before; it was never bookmarked)"] : []),
         ...(attachmentIds ? [`attachments: ${attachmentIds}`] : []),
         "body:",
@@ -191,11 +211,16 @@ async function readOneEntry(state, after) {
  * turn, and stop. The bookmark advances only in onSettled, after Pi's
  * agent_settled event for that turn. Never more than one injected entry
  * awaits settlement. */
-async function drain(ctx, state, replayPending = false) {
+async function drain(pi, ctx, state, replayPending = false) {
     if (draining)
         return;
     draining = true;
     try {
+        // Do not queue an inbox entry behind an unrelated active turn. Otherwise
+        // that turn's agent_settled event could bookmark the queued entry before
+        // Pi has actually processed it. onSettled drains again once Pi is idle.
+        if (streaming(ctx))
+            return;
         const saved = (await readState()) ?? state;
         // Resume the persisted view; a socket drop never advances the bookmark.
         state.last_sequence = saved.last_sequence;
@@ -208,7 +233,7 @@ async function drain(ctx, state, replayPending = false) {
                 notify(ctx, "myagent could not replay the pending inbox entry; reconnect this session.");
                 return;
             }
-            await ctx.sendUserMessage(envelopeText(pending, true), streaming(ctx) ? { deliverAs: "followUp" } : undefined);
+            pi.sendUserMessage(envelopeText(pending, true));
             return;
         }
         const entry = await readOneEntry(state, state.last_sequence);
@@ -217,7 +242,7 @@ async function drain(ctx, state, replayPending = false) {
         state.pending_sequence = entry.sequence;
         await writeState(state);
         try {
-            await ctx.sendUserMessage(envelopeText(entry, false), streaming(ctx) ? { deliverAs: "followUp" } : undefined);
+            pi.sendUserMessage(envelopeText(entry, false));
         }
         catch {
             // Injection failed: do not bookmark. The persisted pending marker is
@@ -233,10 +258,14 @@ async function drain(ctx, state, replayPending = false) {
 }
 /** Pi settled an agent turn. If a myagent entry is awaiting settlement,
  * bookmark it now, persist, clear pending, then drain the next entry. */
-async function onSettled(ctx) {
+async function onSettled(pi, ctx) {
     const state = await readState();
-    if (!state || state.pending_sequence === null)
+    if (!state)
         return;
+    if (state.pending_sequence === null) {
+        await drain(pi, ctx, state);
+        return;
+    }
     const settled = state.pending_sequence;
     try {
         await api("/v1/inbox/bookmark", { method: "PUT", body: JSON.stringify({ sequence: settled }) }, state.token);
@@ -248,15 +277,47 @@ async function onSettled(ctx) {
     state.last_sequence = Math.max(state.last_sequence, settled);
     state.pending_sequence = null;
     await writeState(state);
-    await drain(ctx, state);
+    await drain(pi, ctx, state);
 }
 export default function registerMyagent(pi) {
+    pi.registerTool({
+        name: "myagent_send_message",
+        label: "Send myagent message",
+        description: "Send one plaintext message to an accepted myagent contact from the address connected to this exact Pi session.",
+        parameters: Type.Object({
+            to: Type.String({ description: "Destination myagent address, for example ajay/researcher." }),
+            body: Type.String({ minLength: 1, maxLength: 32768, description: "Plaintext message body." }),
+            message_id: Type.Optional(Type.String({ description: "Optional UUIDv7 idempotency key. Omit for a new message." }))
+        }, { additionalProperties: false }),
+        promptSnippet: "Send a message through the myagent address connected to this Pi session.",
+        promptGuidelines: [
+            "Use myagent_send_message to reply to a [myagent inbox] turn; never encode the destination in a TO: prefix.",
+            "Only report delivery after the tool returns accepted."
+        ],
+        execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+            const state = await requireActiveBinding(ctx);
+            const messageId = params.message_id || uuidv7();
+            const result = await api("/v1/messages", {
+                method: "POST",
+                body: JSON.stringify({
+                    message_id: messageId,
+                    to: params.to,
+                    content: { encoding: "plaintext", text: params.body },
+                    attachment_ids: []
+                })
+            }, state.token);
+            return {
+                content: [{ type: "text", text: `Message accepted for ${params.to} at recipient sequence ${result.recipient_sequence}${result.duplicate ? " (duplicate)" : ""}.` }],
+                details: { message_id: messageId, to: params.to, ...result }
+            };
+        }
+    });
     pi.registerCommand("myagent", {
         description: "Connect, inspect, or disconnect this exact Pi session from myagent",
         handler: async (args, ctx) => {
             const command = args.trim().split(/\s+/)[0] || "status";
             if (command === "connect")
-                return connect(ctx);
+                return connect(pi, ctx);
             if (command === "disconnect")
                 return disconnect(ctx);
             if (command !== "status")
@@ -279,11 +340,11 @@ export default function registerMyagent(pi) {
             return;
         activeCtx = ctx;
         stopReconnect();
-        await openSocket(ctx, state);
-        await drain(ctx, state, true);
+        await openSocket(pi, ctx, state);
+        await drain(pi, ctx, state, true);
     });
     pi.on("agent_settled", async (_event, ctx) => {
-        await onSettled(ctx ?? activeCtx ?? {});
+        await onSettled(pi, ctx ?? activeCtx ?? {});
     });
     pi.on("session_shutdown", async () => {
         stopReconnect();

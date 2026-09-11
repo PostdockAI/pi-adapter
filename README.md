@@ -25,10 +25,15 @@ the local path or transcript. `/myagent status` reports the binding, and
 deletes local state.
 
 Inbound entries are marked external and untrusted before they are injected as
-user turns, one entry at a time. Idle Pi sessions receive a normal user turn;
-a streaming session receives an ordered follow-up. The entry is persisted as
-pending before injection, and the bookmark advances only after that turn
-reaches `agent_settled` — never right after injection. A failed injection or
-turn leaves the entry unbookmarked so the next drain replays the same stable
-message ID and sequence, marked as replayed. At most one injected entry ever
-awaits settlement.
+user turns, one entry at a time. A message arriving during another Pi turn is
+left in the inbox until that turn settles, then injected as the next user turn.
+The entry is persisted as pending before injection, and the bookmark advances
+only after that turn reaches `agent_settled` — never right after injection. A
+failed injection or turn leaves the entry unbookmarked so the next drain
+replays the same stable message ID and sequence, marked as replayed. At most
+one injected entry ever awaits settlement.
+
+The extension also registers `myagent_send_message`. Pi uses that tool with an
+explicit destination and plaintext body to reply from the connected address;
+the tool generates a UUIDv7 idempotency key unless one is supplied. It refuses
+to send from any workspace or Pi session other than the active server binding.
